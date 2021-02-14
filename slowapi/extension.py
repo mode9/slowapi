@@ -215,7 +215,7 @@ class Limiter:
         self._fallback_limiter = None
         self.__check_backend_count = 0
         self.__last_check_backend = time.time()
-        self.__marked_for_limiting: Dict[str, List[Callable]] = {}
+        self._marked_for_limiting: Dict[str, List[Callable]] = {}
 
         class BlackHoleHandler(logging.StreamHandler):
             def emit(*_):
@@ -435,6 +435,7 @@ class Limiter:
                     args = [self._key_prefix] + args
                 if not limit_for_header or lim.limit < limit_for_header[0]:
                     limit_for_header = (lim.limit, args)
+
                 if not self.limiter.hit(lim.limit, *args):
                     self.logger.warning(
                         "ratelimit %s (%s) exceeded at endpoint: %s",
@@ -452,7 +453,6 @@ class Limiter:
                 continue
         # keep track of which limit was hit, to be picked up for the response header
         request.state.view_rate_limit = limit_for_header
-
         if failed_limit:
             raise RateLimitExceeded(failed_limit)
 
@@ -500,7 +500,7 @@ class Limiter:
         try:
             all_limits: List[Limit] = []
             if self._storage_dead and self._fallback_limiter:
-                if in_middleware and name in self.__marked_for_limiting:
+                if in_middleware and name in self._marked_for_limiting:
                     pass
                 else:
                     if self.__should_check_backend() and self._storage.check():
@@ -522,7 +522,7 @@ class Limiter:
                 )
                 if (
                     not route_limits
-                    and not (in_middleware and name in self.__marked_for_limiting)
+                    and not (in_middleware and name in self._marked_for_limiting)
                     or combined_defaults
                 ):
                     all_limits += list(itertools.chain(*self._default_limits))
@@ -593,7 +593,7 @@ class Limiter:
                     self.logger.error(
                         "Failed to configure throttling for %s (%s)", name, e,
                     )
-            self.__marked_for_limiting.setdefault(name, []).append(func)
+            self._marked_for_limiting.setdefault(name, []).append(func)
             if dynamic_limit:
                 self._dynamic_route_limits.setdefault(name, []).append(dynamic_limit)
             else:
@@ -755,3 +755,125 @@ class Limiter:
 
         self._exempt_routes.add(name)
         return __inner
+
+
+def get_limits(
+    limit_value: StrOrCallableStr,
+    key_func: Optional[Callable[..., str]] = None,
+    shared: bool = False,
+    scope: Optional[StrOrCallableStr] = None,
+    per_method: bool = False,
+    methods: Optional[List[str]] = None,
+    error_message: Optional[str] = None,
+    exempt_when: Optional[Callable[..., bool]] = None,
+    override_defaults: bool = True,
+):
+    _scope = scope if shared else None
+    dynamic_limit = None
+    static_limits: List[Limit] = []
+    if callable(limit_value):
+        dynamic_limit = LimitGroup(
+            limit_value,
+            key_func,
+            _scope,
+            per_method,
+            methods,
+            error_message,
+            exempt_when,
+            override_defaults,
+        )
+    else:
+        try:
+            static_limits = list(
+                LimitGroup(
+                    limit_value,
+                    key_func,
+                    _scope,
+                    per_method,
+                    methods,
+                    error_message,
+                    exempt_when,
+                    override_defaults,
+                )
+            )
+        except ValueError as e:
+            logger = logging.getLogger("slowapi")
+            logger.error(
+                "Failed to configure throttling (%s)", e,
+            )
+    return dynamic_limit, static_limits
+
+
+class Throttle:
+    @classmethod
+    def limit(
+            cls,
+            limiter: Limiter,
+            limit_value: Union[str, Callable[[str], str]],
+            key_func: Optional[Callable[..., str]] = None,
+            per_method: bool = False,
+            methods: Optional[List[str]] = None,
+            error_message: Optional[str] = None,
+            exempt_when: Optional[Callable[..., bool]] = None,
+            override_defaults: bool = True,
+    ):
+        cls.limiter = limiter
+        _scope = None
+        keyfunc = key_func or limiter._key_func
+        cls.shared = False
+        cls.attrs = [
+            limit_value,
+            keyfunc,
+            cls.shared,
+            _scope,
+            per_method,
+            methods,
+            error_message,
+            exempt_when,
+            override_defaults
+        ]
+        cls.dynamic_limit, cls.static_limits = get_limits(*cls.attrs)
+        return cls()
+
+    @staticmethod
+    def get_func(app, path):
+        route = list(filter(lambda x: x.path == path, app.routes))[0]
+        return route.endpoint
+
+    def __call__(self, request: Request, response: Response):
+        name = request.scope["path"]
+        func = self.get_func(request.app, name)
+        name = f"{func.__module__}.{func.__name__}"
+        self.limiter._marked_for_limiting.setdefault(name, []).append(func)
+
+        # TODO: route_limits 평가될때 한번만 실행되도록. 매번 리밋이 쌓임
+        if self.dynamic_limit:
+            self.limiter._dynamic_route_limits.setdefault(name, []).append(
+                self.dynamic_limit
+            )
+        else:
+            self.limiter._route_limits.setdefault(name, []).extend(
+                self.static_limits
+            )
+
+        # not support websocket yet.
+        connection_type: Optional[str] = "request"
+        if self.limiter._auto_check and not getattr(
+                request.state, "_rate_limiting_complete", False
+        ):
+            self.limiter._check_request_limit(request, func, False)
+            request.state._rate_limiting_complete = True
+        if not isinstance(response, Response):
+            # get the response object from the decorated endpoint function
+            self.limiter._inject_headers(
+                response, request.state.view_rate_limit
+                # type: ignore
+            )
+        else:
+            self.limiter._inject_headers(
+                response, request.state.view_rate_limit
+            )
+
+        self.limiter._dynamic_route_limits[name] = []
+        self.limiter._route_limits[name] = []
+        return response
